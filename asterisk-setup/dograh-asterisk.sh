@@ -6,11 +6,13 @@
 #   sudo ARI_PASS=xxxx ./dograh-asterisk.sh config      saari config files likho + restart
 #   sudo ./dograh-asterisk.sh firewall           iptables rules (duplicate hata kar)
 #   sudo ./dograh-asterisk.sh stasis dograh_xxx  Dograh ka Stasis App Name dialplan me daalo
-#   sudo ARI_PASS=xxxx ./dograh-asterisk.sh check       sab kuch verify
+#   sudo ./dograh-asterisk.sh check              sab kuch verify (ARI password ari.conf se khud padhta hai)
+#   sudo ./dograh-asterisk.sh ari-pass           ari.conf wala asli ARI password dikhao (Dograh me yahi daalo)
 #
 # Optional env (defaults aapke setup ke hisaab se):
 #   PUBLIC_IP=140.245.7.25  DID=919429491500  TECH=45454
 #   VL_HOST=sip.voicelink.co.in  VL_PORT=3300  VL_MATCH=160.30.71.0/24
+#   SIP_ALLOW=any (default, sabko khula). Call chalne ke BAAD lock: SIP_ALLOW=160.30.71.0/24,<IP> ./dograh-asterisk.sh firewall
 #   VL_USER / VL_PASS  (optional: sirf tab kaam aate hain jab Voicelink digest-auth maange)
 
 set -euo pipefail
@@ -30,6 +32,13 @@ WS_NAME="dograh"
 AST="${AST:-asterisk}"
 ASTCONF=()
 [ -n "${ASTCONF_FILE:-}" ] && ASTCONF=(-C "$ASTCONF_FILE")
+
+ari_pass_from_conf() {
+  awk -F'=' -v u="$ARI_USER" '
+    /^\[/ { f = ($0 == "[" u "]"); next }
+    f && $1 ~ /^[ \t]*password[ \t]*$/ { gsub(/[ \t\r]/, "", $2); print $2; exit }
+  ' "$ETC/ari.conf" 2>/dev/null || true
+}
 
 need_root() { [ "$(id -u)" -eq 0 ] || { echo "sudo ke saath chalao"; exit 1; }; }
 rx() { "$AST" "${ASTCONF[@]}" -rx "$1"; }
@@ -181,11 +190,20 @@ EOF
   STASIS="dograh_PENDING"
   if [ -f "$ETC/extensions.conf" ]; then
     old=$(grep -oE 'Stasis\([^)]*\)' "$ETC/extensions.conf" | head -1 | sed -E 's/Stasis\((.*)\)/\1/' || true)
-    [ -n "${old:-}" ] && STASIS="$old"
+    [[ "${old:-}" =~ ^dograh_[a-f0-9]{6,}$ ]] && STASIS="$old"
   fi
   write_dialplan "$STASIS"
   restart_ast
   echo "config done. Stasis abhi: $STASIS"
+  if [ "${NO_RESTART:-0}" != "1" ]; then
+    code=$(curl -s -m 5 -o /dev/null -w '%{http_code}' -u "$ARI_USER:$ARI_PASS" http://127.0.0.1:8088/ari/asterisk/info || true)
+    if [ "$code" = "200" ]; then
+      echo "ARI login test: OK (HTTP 200)"
+      echo "Dograh me ARI Password yahi daalo: $ARI_PASS"
+    else
+      echo "ARI login test: FAIL (HTTP $code). 'sudo ./dograh-asterisk.sh check' chalao"
+    fi
+  fi
 }
 
 write_dialplan() {
@@ -240,11 +258,20 @@ cmd_firewall() {
   iptables -I INPUT 1 -p tcp --dport 8088 ! -s 172.16.0.0/12 -j DROP
   iptables -I INPUT 1 -p tcp --dport 8088 -s 172.16.0.0/12 -j ACCEPT
   iptables -I INPUT 1 -p tcp --dport 8088 -s 127.0.0.1 -j ACCEPT
-  # RTP (awaaz) + SIP. 5060 sabko open: Asterisk khud sirf VL_MATCH ko pehchanta hai,
-  # baaki ko reject karta hai. (Agar Voicelink ka IP alag nikla to call chup-chaap
-  # block nahi hogi, log me "No matching endpoint" dikhega.)
+  # RTP (awaaz) sabko open (Voicelink ke media IP alag ho sakte hain).
   iptables -I INPUT 1 -p udp --dport 10000:20000 -j ACCEPT
-  iptables -I INPUT 1 -p udp --dport 5060 -j ACCEPT
+  # SIP 5060: default sabko khula. Scanner spam rokne ke liye call chalne ke baad SIP_ALLOW se lock karo.
+  SIP_ALLOW="${SIP_ALLOW:-any}"
+  if [ "$SIP_ALLOW" = "any" ]; then
+    iptables -I INPUT 1 -p udp --dport 5060 -j ACCEPT
+  else
+    vlip=$(getent ahostsv4 "$VL_HOST" 2>/dev/null | awk 'NR==1{print $1}' || true)
+    iptables -I INPUT 1 -p udp --dport 5060 -j DROP
+    for n in ${SIP_ALLOW//,/ } $vlip; do
+      [ -n "$n" ] && iptables -I INPUT 1 -p udp --dport 5060 -s "$n" -j ACCEPT
+    done
+    echo "SIP 5060 allowed sirf: ${SIP_ALLOW} ${vlip}"
+  fi
   if [ "${NO_PERSIST:-0}" != "1" ]; then
     command -v netfilter-persistent >/dev/null || DEBIAN_FRONTEND=noninteractive apt-get install -y iptables-persistent
     netfilter-persistent save
@@ -262,11 +289,25 @@ cmd_check() {
   echo "== 2. PJSIP"
   rx "pjsip show endpoint voicelink" | grep -E "Endpoint:|Match|Contact:|allow" | head -6 || true
   echo "== 3. ARI (localhost)"
-  if [ -n "${ARI_PASS:-}" ]; then
-    out=$(curl -s -m 5 -u "$ARI_USER:$ARI_PASS" http://127.0.0.1:8088/ari/asterisk/info || true)
-    case "$out" in *'"version"'*) ok "ARI login" ;; *) bad "ARI login (password/http.conf)" ;; esac
+  CONF_PASS=$(ari_pass_from_conf)
+  ARI_PASS="${ARI_PASS:-$CONF_PASS}"
+  if [ -n "$CONF_PASS" ] && [ "$ARI_PASS" != "$CONF_PASS" ]; then
+    bad "ARI_PASS jo tumne diya woh ari.conf se alag hai. ari.conf ka password: $CONF_PASS"
+    ARI_PASS="$CONF_PASS"
+  fi
+  if [ -n "$ARI_PASS" ]; then
+    tmp=$(mktemp)
+    code=$(curl -s -m 5 -o "$tmp" -w '%{http_code}' -u "$ARI_USER:$ARI_PASS" http://127.0.0.1:8088/ari/asterisk/info || true)
+    case "$code" in
+      200) ok "ARI login (HTTP 200)" ;;
+      401) bad "ARI login HTTP 401 = user/password galat. ari.conf me [$ARI_USER] ka password dekho" ;;
+      000) bad "ARI se connect nahi hua. http.conf / Asterisk chal raha hai? (asterisk -rx 'http show status')" ;;
+      *)   bad "ARI HTTP $code: $(head -c 200 "$tmp")" ;;
+    esac
+    rm -f "$tmp"
+    rx "ari show users" 2>/dev/null | head -5 || true
     echo "  Registered Stasis apps: $(curl -s -m 5 -u "$ARI_USER:$ARI_PASS" http://127.0.0.1:8088/ari/applications | grep -oE '"name": *"[^"]*"' | tr '\n' ' ')"
-  else echo "  (ARI_PASS dene par ARI test hoga)"; fi
+  else echo "  ari.conf nahi mila ya password khali. Pehle: config"; fi
   echo "== 4. Dograh backend port 8000 (Asterisk ye use karta hai)"
   out=$(curl -s -m 5 http://127.0.0.1:8000/api/v1/health || true)
   case "$out" in *'"status":"ok"'*) ok "Dograh API 127.0.0.1:8000" ;; *) bad "Dograh API 8000 nahi mila" ;; esac
@@ -274,16 +315,31 @@ cmd_check() {
   PRIV=$(ip -4 route get 1.1.1.1 2>/dev/null | grep -oE 'src [0-9.]+' | awk '{print $2}')
   [ -n "$PRIV" ] || PRIV=$(hostname -I | awk '{print $1}')
   if command -v docker >/dev/null && [ -n "${ARI_PASS:-}" ]; then
-    out=$(docker run --rm curlimages/curl -s -m 5 -u "$ARI_USER:$ARI_PASS" "http://$PRIV:8088/ari/asterisk/info" 2>/dev/null || true)
-    case "$out" in *'"version"'*) ok "Dograh container -> http://$PRIV:8088" ;; *) bad "container se ARI nahi pahunch raha (firewall)" ;; esac
+    code=$(docker run --rm curlimages/curl -s -m 5 -o /dev/null -w '%{http_code}' -u "$ARI_USER:$ARI_PASS" "http://$PRIV:8088/ari/asterisk/info" 2>/dev/null || true)
+    case "$code" in
+      200) ok "Dograh container -> http://$PRIV:8088 (HTTP 200)" ;;
+      401) bad "container pahunch gaya par password galat (HTTP 401)" ;;
+      *)   bad "container se ARI nahi pahunch raha (HTTP '${code:-none}'): firewall ya docker image pull" ;;
+    esac
   fi
   echo "== 6. Dialplan"
-  rx "dialplan show dograh-in" | grep -E "Stasis" || true
+  st=$(rx "dialplan show dograh-in" | grep -oE 'Stasis\([^)]*\)' | head -1 || true)
+  case "$st" in
+    *dograh_*) ok "dialplan: $st" ;;
+    *) bad "dialplan me ${st:-Stasis nahi} hai. Chalao: sudo ./dograh-asterisk.sh stasis dograh_<tumhara_naam>" ;;
+  esac
+  echo "== 7. Voicelink IP"
+  vlip=$(getent ahostsv4 "$VL_HOST" 2>/dev/null | awk 'NR==1{print $1}' || true)
+  echo "  $VL_HOST -> ${vlip:-?}   (match range: $VL_MATCH)"
+  if [ -n "$vlip" ] && command -v python3 >/dev/null; then
+    python3 -c "import ipaddress,sys; sys.exit(0 if ipaddress.ip_address('$vlip') in ipaddress.ip_network('$VL_MATCH') else 1)" \
+      && ok "Voicelink IP match range me hai" || bad "Voicelink IP range ke bahar. VL_MATCH='$VL_MATCH,$vlip/32' ke saath config chalao"
+  fi
   echo
   echo "Dograh me paste karne ki values:"
   echo "  ARI Endpoint    : http://$PRIV:8088"
   echo "  ARI Username    : $ARI_USER"
-  echo "  ARI Password    : (jo ARI_PASS rakha)"
+  echo "  ARI Password    : ${ARI_PASS:-(ari.conf nahi mila)}"
   echo "  websocket_client.conf Name : $WS_NAME"
   echo "  Dial String Template       : Local/{number}@dograh-out/n"
 }
@@ -294,6 +350,7 @@ case "${1:-}" in
   config) need_root; cmd_config ;;
   firewall) cmd_firewall ;;
   stasis) shift; cmd_stasis "${1:-}" ;;
-  check) cmd_check ;;
+  check) need_root; cmd_check ;;
+  ari-pass) need_root; ari_pass_from_conf ;;
   *) sed -n '2,16p' "$0"; exit 1 ;;
 esac
