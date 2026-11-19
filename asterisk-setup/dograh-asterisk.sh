@@ -7,10 +7,13 @@
 #   sudo ./dograh-asterisk.sh firewall           iptables rules (duplicate hata kar)
 #   sudo ./dograh-asterisk.sh stasis dograh_xxx  Dograh ka Stasis App Name dialplan me daalo
 #   sudo ./dograh-asterisk.sh check              sab kuch verify (ARI password ari.conf se khud padhta hai)
+#   sudo ./dograh-asterisk.sh trace              live SIP trace (Voicelink ka jawab dekhne ke liye)
+#   sudo ./dograh-asterisk.sh testout 98xxxxxxxx  Dograh ke bina seedha outbound test
 #   sudo ./dograh-asterisk.sh ari-pass           ari.conf wala asli ARI password dikhao (Dograh me yahi daalo)
 #
 # Optional env (defaults aapke setup ke hisaab se):
 #   PUBLIC_IP=140.245.7.25  DID=919429491500  TECH=45454
+#   COUNTRY=91 (khali karne par 10 digit hi jayega; format test ke liye: stasis command ke saath do)
 #   VL_HOST=sip.voicelink.co.in  VL_PORT=3300  VL_MATCH=160.30.71.0/24
 #   SIP_ALLOW=any (default, sabko khula). Call chalne ke BAAD lock: SIP_ALLOW=160.30.71.0/24,<IP> ./dograh-asterisk.sh firewall
 #   VL_USER / VL_PASS  (optional: sirf tab kaam aate hain jab Voicelink digest-auth maange)
@@ -20,7 +23,8 @@ set -euo pipefail
 ETC="${ETC:-/etc/asterisk}"
 PUBLIC_IP="${PUBLIC_IP:-140.245.7.25}"
 DID="${DID:-919429491500}"
-TECH="${TECH:-45454}"
+TECH="${TECH-45454}"
+COUNTRY="${COUNTRY-91}"
 VL_HOST="${VL_HOST:-sip.voicelink.co.in}"
 VL_PORT="${VL_PORT:-3300}"
 VL_MATCH="${VL_MATCH:-160.30.71.0/24}"
@@ -221,11 +225,14 @@ exten => _X.,1,NoOp(TO DOGRAH exten=\${EXTEN})
 
 ; ---- Dograh se outbound -> Voicelink ($TECH + 91 + last 10 digit) ----
 [dograh-out]
+; 'h' (hangup) ko _. pattern pakad leta tha aur bekar 2nd call (number khali) Voicelink ko bhejta tha. Ab roka.
+exten => h,1,NoOp(DOGRAH OUT hangup status=\${DIALSTATUS} cause=\${HANGUPCAUSE})
 exten => _.,1,NoOp(DOGRAH OUT \${EXTEN})
  same => n,Set(NUM=\${FILTER(0-9,\${EXTEN})})
  same => n,Set(CALLERID(num)=$DID)
  same => n,Set(CALLERID(name)=$DID)
- same => n,Dial(PJSIP/${TECH}91\${NUM:-10}@voicelink,60)
+ same => n,Dial(PJSIP/${TECH}${COUNTRY}\${NUM:-10}@voicelink,60)
+ same => n,NoOp(DIAL RESULT status=\${DIALSTATUS} sipcause=\${HANGUPCAUSE})
  same => n,Hangup()
 EOF
 }
@@ -237,6 +244,42 @@ cmd_stasis() {
   rx "dialplan reload" >/dev/null
   rx "dialplan show from-voicelink"
   rx "dialplan show dograh-in"
+}
+
+cmd_trace() {
+  need_root
+  command -v tcpdump >/dev/null || { apt-get update -y >/dev/null; apt-get install -y tcpdump >/dev/null; }
+  F="${TRACE_FILTER:-udp and net $VL_MATCH and (port 5060 or port $VL_PORT)}"
+  echo "SIP trace shuru (filter: $F)."
+  echo "Ab call karo. Ctrl+C se band. Dekhna: 'INVITE sip:...' aur uske baad 'SIP/2.0 NNN ...' jawab."
+  tcpdump -l -ni any -s0 -A $F 2>/dev/null | sed -u 's/\r$//' | \
+    grep -aoE --line-buffered '^[0-9:.]+ +[^ ]+ +(In|Out) +IP [^ ]+ > [^ :]+|INVITE sip:[^ ]+|SIP/2\.0 [0-9]{3} [A-Za-z ]*|^(From|To|Reason|Warning|P-Asserted-Identity|Remote-Party-ID):.*'
+}
+
+cmd_testout() {
+  need_root
+  num="${1:-}"
+  [[ "$num" =~ ^\+?[0-9]{10,13}$ ]] || { echo "Use: sudo ./dograh-asterisk.sh testout 8252487551"; exit 1; }
+  command -v tcpdump >/dev/null || { apt-get update -y >/dev/null; apt-get install -y tcpdump >/dev/null; }
+  raw=$(mktemp)
+  F="udp and net $VL_MATCH and (port 5060 or port $VL_PORT)"
+  # shellcheck disable=SC2086
+  tcpdump -l -ni any -s0 -A $F > "$raw" 2>/dev/null &
+  tp=$!
+  sleep 1
+  echo "Call lag rahi hai: $num  (phone baje to utha lo; max ~70 sec)"
+  rx "channel originate Local/${num}@dograh-out application Wait 20" || true
+  for i in $(seq 1 70); do
+    sleep 1
+    n=$(rx "core show channels count" 2>/dev/null | grep -oE '^[0-9]+ active channel' | grep -oE '^[0-9]+' || true)
+    [ "${n:-0}" = "0" ] && [ "$i" -gt 3 ] && break
+  done
+  sleep 1; kill "$tp" 2>/dev/null || true; wait "$tp" 2>/dev/null || true
+  echo "===== SIP jo Voicelink ke saath hua ====="
+  tr -d '\r' < "$raw" | grep -aoE '^[0-9:.]+ +[^ ]+ +(In|Out) +IP [^ ]+ > [^ :]+|INVITE sip:[^ ]+|SIP/2\.0 [0-9]{3} [A-Za-z ]*|^(From|To|Reason|Warning|P-Asserted-Identity):.*' || echo "(koi SIP packet nahi dikha: call Asterisk se Voicelink tak gayi hi nahi)"
+  echo "========================================="
+  echo "Upar 'INVITE' ke baad jo 'SIP/2.0 NNN' aaya wahi Voicelink ka asli jawab hai."
+  rm -f "$raw"
 }
 
 cmd_firewall() {
@@ -351,6 +394,8 @@ case "${1:-}" in
   firewall) cmd_firewall ;;
   stasis) shift; cmd_stasis "${1:-}" ;;
   check) need_root; cmd_check ;;
+  trace) cmd_trace ;;
+  testout) shift; cmd_testout "${1:-}" ;;
   ari-pass) need_root; ari_pass_from_conf ;;
-  *) sed -n '2,16p' "$0"; exit 1 ;;
+  *) sed -n '2,18p' "$0"; exit 1 ;;
 esac
