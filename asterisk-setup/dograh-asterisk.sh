@@ -25,6 +25,7 @@ PUBLIC_IP="${PUBLIC_IP:-140.245.7.25}"
 DID="${DID:-919429491500}"
 TECH="${TECH-45454}"
 COUNTRY="${COUNTRY-91}"
+REL100="${REL100:-no}"   # PJSIP 100rel: Voicelink 183 ko PRACK maangta tha aur fail hota tha
 VL_HOST="${VL_HOST:-sip.voicelink.co.in}"
 VL_PORT="${VL_PORT:-3300}"
 VL_MATCH="${VL_MATCH:-160.30.71.0/24}"
@@ -109,6 +110,7 @@ EOF
 }
 
 cmd_config() {
+  ARI_PASS="${ARI_PASS:-$(ari_pass_from_conf)}"
   : "${ARI_PASS:?ARI_PASS set karo (sirf letters+numbers, min 8)}"
   [[ "$ARI_PASS" =~ ^[A-Za-z0-9]{8,}$ ]] || { echo "ARI_PASS me sirf letters/numbers, min 8 char"; exit 1; }
   mkdir -p "$ETC"
@@ -182,6 +184,7 @@ direct_media=no
 rtp_symmetric=yes
 force_rport=yes
 rewrite_contact=yes
+100rel=$REL100
 dtmf_mode=rfc4733
 $OUTAUTH
 
@@ -246,6 +249,8 @@ cmd_stasis() {
   rx "dialplan show dograh-in"
 }
 
+SIP_GREP='^[0-9:.]+ +[^ ]+ +(In|Out) +IP [^ ]+ > [^ :]+|(INVITE|PRACK|ACK|BYE|CANCEL|UPDATE|OPTIONS) sip:[^ ]+|SIP/2\.0 [0-9]{3} [A-Za-z ]*|^(From|To|CSeq|RSeq|RAck|Require|Supported|Reason|Warning|P-Asserted-Identity|Remote-Party-ID):.*'
+
 cmd_trace() {
   need_root
   command -v tcpdump >/dev/null || { apt-get update -y >/dev/null; apt-get install -y tcpdump >/dev/null; }
@@ -253,7 +258,7 @@ cmd_trace() {
   echo "SIP trace shuru (filter: $F)."
   echo "Ab call karo. Ctrl+C se band. Dekhna: 'INVITE sip:...' aur uske baad 'SIP/2.0 NNN ...' jawab."
   tcpdump -l -ni any -s0 -A $F 2>/dev/null | sed -u 's/\r$//' | \
-    grep -aoE --line-buffered '^[0-9:.]+ +[^ ]+ +(In|Out) +IP [^ ]+ > [^ :]+|INVITE sip:[^ ]+|SIP/2\.0 [0-9]{3} [A-Za-z ]*|^(From|To|Reason|Warning|P-Asserted-Identity|Remote-Party-ID):.*'
+    grep -aoE --line-buffered "$SIP_GREP"
 }
 
 cmd_testout() {
@@ -276,7 +281,8 @@ cmd_testout() {
   done
   sleep 1; kill "$tp" 2>/dev/null || true; wait "$tp" 2>/dev/null || true
   echo "===== SIP jo Voicelink ke saath hua ====="
-  tr -d '\r' < "$raw" | grep -aoE '^[0-9:.]+ +[^ ]+ +(In|Out) +IP [^ ]+ > [^ :]+|INVITE sip:[^ ]+|SIP/2\.0 [0-9]{3} [A-Za-z ]*|^(From|To|Reason|Warning|P-Asserted-Identity):.*' || echo "(koi SIP packet nahi dikha: call Asterisk se Voicelink tak gayi hi nahi)"
+  cp "$raw" /tmp/sip-last.txt 2>/dev/null || true
+  tr -d '\r' < "$raw" | grep -aoE "$SIP_GREP" | uniq || echo "(koi SIP packet nahi dikha: call Asterisk se Voicelink tak gayi hi nahi)"
   echo "========================================="
   echo "Upar 'INVITE' ke baad jo 'SIP/2.0 NNN' aaya wahi Voicelink ka asli jawab hai."
   rm -f "$raw"
